@@ -127,12 +127,14 @@ To run the project from source, see here: [Build and run from source](./SOURCE.m
   * UEFI bootx64.efi research
   * universal2 build research
   * Various documentation contributions
+* [e94904](https://github.com/e94904)
+  * AMD GCN Graphics Patch
 * Amazing users who've graciously donate hardware:
   * [JohnD](https://forums.macrumors.com/members/johnd.53633/) - 2013 Mac Pro
   * [SpiGAndromeda](https://github.com/SpiGAndromeda) - AMD Vega 64
   * [turbomacs](https://github.com/turbomacs) - 2014 5k iMac
   * [vinaypundith](https://forums.macrumors.com/members/vinaypundith.1212357/) - MacBook7,1
-   * [ThatStella7922](https://github.com/ThatStella7922) - 2017 13" MacBook Pro (A1708)
+  * [ThatStella7922](https://github.com/ThatStella7922) - 2017 13" MacBook Pro (A1708)
   * zephar - 2008 Mac Pro
   * jazo97 - 2011 15" MacBook Pro
   * And others (reach out if we forgot you!)
