@@ -36,7 +36,10 @@ class GenerateDiskImages:
             "Launch Services",
         ]
 
-        whitelist_files = []
+        whitelist_files = [
+            "libAMDFix.dylib",
+            "libAMDFix.m",
+        ]
 
         print("Deleting extra binaries...")
         for file in Path("payloads").glob(pattern="*"):

@@ -820,6 +820,10 @@ class Constants:
         return self.payload_path / Path("MetallibSupportPkg.pkg")
 
     @property
+    def amd_fix_path(self):
+        return self.payload_path / Path("libAMDFix.dylib")
+
+    @property
     def icons_path(self):
         return [
             str(self.icon_path_macos_generic),
