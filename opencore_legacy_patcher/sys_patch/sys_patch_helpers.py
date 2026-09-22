@@ -6,6 +6,9 @@ import os
 import logging
 import plistlib
 import subprocess
+import struct
+import shutil
+import tempfile
 
 from typing import Union
 from pathlib import Path
@@ -110,7 +113,9 @@ class SysPatchHelpers:
             "Kernel Debug Kit Used": f"{kdk_string}",
             "Metal Library Used": f"{metallib_used_string}",
             "OS Version": f"{self.constants.detected_os}.{self.constants.detected_os_minor} ({self.constants.detected_os_build})",
-            "Custom Signature": bool(Path(self.constants.payload_local_binaries_root_path / ".signed").exists()),
+            "Custom Signature": bool(Path(self.constants.payload_local_binaries_root_path / ".signed").exists()) and not (
+                "AMD Legacy GCN" in patchset and self.constants.detected_os >= os_data.os_data.sequoia
+            ),
         }
 
         data.update(patchset)
@@ -245,3 +250,138 @@ class SysPatchHelpers:
                 subprocess_wrapper.run_as_root_and_verify(generate_copy_arguments(f"{src_dir}/lib", f"{DEST_DIR}/"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
             break
+
+
+    def patch_amd_legacy_gcn(self, mount_point: Union[str, Path]) -> None:
+        """
+        Fix AMD Legacy GCN driver crashes in macOS 15 Sequoia:
+        1. libAMDIL902.dylib: Null-pointer dereference in initializeIABArgTypeSet (0x7DBFE -> 0xAD0430 cave)
+        2. AMDMTLBronzeDriver: Inject LC_LOAD_DYLIB for @loader_path/libAMDFix.dylib
+        3. libAMDFix.dylib: Companion helper for reflection unwrapping and IAB alignment/constant data sink
+        """
+        if self.constants.detected_os < os_data.os_data.sequoia:
+            return
+
+        logging.info("Applying AMD Legacy GCN Metal and compiler stability patches")
+
+        mount_point = Path(mount_point)
+        il_dest = mount_point / "System/Library/Extensions/AMDShared.bundle/Contents/PlugIns/libAMDIL902.dylib"
+        drv_dir = mount_point / "System/Library/Extensions/AMDMTLBronzeDriver.bundle/Contents/MacOS"
+        drv_dest = drv_dir / "AMDMTLBronzeDriver"
+        fix_dest = drv_dir / "libAMDFix.dylib"
+        fix_source = self.constants.amd_fix_path
+        if not fix_source.exists():
+            fix_source = self.constants.current_path / "payloads" / "libAMDFix.dylib"
+        if not fix_source.exists():
+            fix_source = Path(__file__).resolve().parents[2] / "payloads" / "libAMDFix.dylib"
+
+        def _rel_call(src: int, dst: int) -> bytes:
+            offset = (dst - (src + 5)) & 0xFFFFFFFF
+            return b'\xE8' + struct.pack('<I', offset)
+
+        def _rel_jmp(src: int, dst: int) -> bytes:
+            offset = (dst - (src + 5)) & 0xFFFFFFFF
+            return b'\xE9' + struct.pack('<I', offset)
+
+        def _write_root_file(data: bytes, dest_path: Path) -> None:
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file.write(data)
+                temp_path = temp_file.name
+            try:
+                subprocess_wrapper.run_as_root_and_verify(["/bin/cp", "-f", temp_path, str(dest_path)])
+                subprocess_wrapper.run_as_root_and_verify(["/bin/chmod", "755", str(dest_path)])
+                subprocess_wrapper.run_as_root_and_verify(["/usr/sbin/chown", "root:wheel", str(dest_path)])
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+
+        # 1. Patch libAMDIL902.dylib
+        if il_dest.exists():
+            logging.info(f"- In-place patching {il_dest.name} for safe null-filter")
+            with open(il_dest, 'rb') as f:
+                il_data = bytearray(f.read())
+
+            if not (len(il_data) > 0xAD0430 and il_data[0x7DBFE] == 0xE9 and il_data[0xAD0430] == 0x4C):
+                cave_va = 0x4ffa0de40430
+                cave_offset = 0xAD0430
+                il_data[cave_offset:cave_offset + 100] = bytes([0x00] * 100)
+
+                cave_code = bytearray()
+                cave_code += bytes.fromhex('4c8d7db8')              # leaq -0x48(%rbp), %r15
+                cave_code += bytes.fromhex('4c8da518ffffff')        # leaq -0xe8(%rbp), %r12
+                cave_code += bytes.fromhex('488b8080000000')        # movq 0x80(%rax), %rax
+                cave_code += bytes.fromhex('4885c0')                # testq %rax, %rax
+                cave_code += bytes.fromhex('740e')                  # je skip (+14 bytes)
+                cave_code += bytes.fromhex('488b10')                # movq (%rax), %rdx
+                cave_code += bytes.fromhex('4c89ff')                # movq %r15, %rdi
+                cave_code += bytes.fromhex('4c89e6')                # movq %r12, %rsi
+                call_pc = cave_va + len(cave_code)
+                cave_code += _rel_call(call_pc, 0x4ffa0d3edc82)     # callq insert (0x7DC82)
+                jmp_pc = cave_va + len(cave_code)
+                cave_code += _rel_jmp(jmp_pc, 0x4ffa0d3edc1e)       # jmp back to 0x7DC1E
+
+                il_data[cave_offset:cave_offset + len(cave_code)] = cave_code
+
+                hook1_va = 0x4ffa0d3edbfe
+                hook1_offset = 0x7DBFE
+                hook1 = _rel_jmp(hook1_va, cave_va) + (b'\x90' * (32 - 5))
+                il_data[hook1_offset:hook1_offset + 32] = hook1
+
+                p2_loc = 0x7E9A2
+                p2_patch = bytes.fromhex('4d85e4742e41833c24007527eb0f')
+                il_data[p2_loc:p2_loc + len(p2_patch)] = p2_patch
+
+                p3_loc = 0x7F851
+                p3_patch = bytes.fromhex('4d85ed742b41837d00007524')
+                il_data[p3_loc:p3_loc + len(p3_patch)] = p3_patch
+
+                loc_run = 0x7DCDA
+                orig_run = bytes([0x55, 0x48, 0x89, 0xe5])
+                if il_data[loc_run:loc_run + 4] != orig_run:
+                    il_data[loc_run:loc_run + 4] = orig_run
+
+                _write_root_file(il_data, il_dest)
+
+                subprocess_wrapper.run_as_root_and_verify(["/usr/bin/codesign", "-f", "-s", "-", str(il_dest)])
+                logging.info(f"- Successfully patched and resigned {il_dest.name}")
+            else:
+                logging.info(f"- {il_dest.name} is already patched")
+
+        # 2. Patch AMDMTLBronzeDriver
+        if drv_dest.exists():
+            logging.info(f"- In-place injecting LC_LOAD_DYLIB into {drv_dest.name}")
+            with open(drv_dest, 'rb') as f:
+                drv_data = bytearray(f.read())
+
+            target_dylib = b'@loader_path/libAMDFix.dylib'
+            hdr = drv_data[:32]
+            magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack('<IIIIIIII', hdr)
+
+            if target_dylib not in drv_data[:32 + sizeofcmds]:
+                path_str = target_dylib + b'\x00'
+                cmdsize = 24 + len(path_str)
+                pad = (8 - (cmdsize % 8)) % 8
+                cmdsize += pad
+                path_str += b'\x00' * pad
+
+                lc = struct.pack('<IIIIII', 0xc, cmdsize, 24, 2, 0x10000, 0x10000) + path_str
+                cmd_offset = 32 + sizeofcmds
+                drv_data[cmd_offset:cmd_offset + cmdsize] = lc
+                struct.pack_into('<II', drv_data, 16, ncmds + 1, sizeofcmds + cmdsize)
+
+                _write_root_file(drv_data, drv_dest)
+
+                subprocess_wrapper.run_as_root_and_verify(["/usr/bin/codesign", "-f", "-s", "-", str(drv_dest)])
+                logging.info(f"- Successfully injected load command and resigned {drv_dest.name}")
+            else:
+                logging.info(f"- {drv_dest.name} already contains load command")
+
+        # 3. Install companion helper libAMDFix.dylib
+        if drv_dir.exists():
+            if fix_source.exists():
+                logging.info(f"- Installing {fix_dest.name} to {drv_dir}")
+                subprocess_wrapper.run_as_root_and_verify(["/bin/cp", "-f", str(fix_source), str(fix_dest)])
+                subprocess_wrapper.run_as_root_and_verify(["/bin/chmod", "755", str(fix_dest)])
+                subprocess_wrapper.run_as_root_and_verify(["/usr/sbin/chown", "root:wheel", str(fix_dest)])
+                subprocess_wrapper.run_as_root_and_verify(["/usr/bin/codesign", "-f", "-s", "-", str(fix_dest)])
+            else:
+                logging.error(f"- Could not find companion library source at {fix_source}")

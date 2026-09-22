@@ -397,9 +397,24 @@ class GenerateDefaults:
             # Root patch with new binaries, then reboot
             return
 
-        # Note: simply checking the authority is not enough, as the authority can be spoofed
-        # (but do we really care? this is just a simple check)
-        # Note: the cert will change
+        # On macOS Sequoia+, AMD Legacy GCN relies on in-place patched compiler drivers
+        # and libAMDFix companion library which are ad-hoc signed.
+        # Until these drivers are signed by Dortania in PatcherSupportPkg, AMFIPass cannot
+        # validate them, so Library Validation must remain disabled.
+        if self.constants.detected_os >= os_data.os_data.sequoia:
+            gpu_archs = []
+            if self.host_is_target:
+                gpu_archs = [gpu.arch for gpu in self.constants.computer.gpus if gpu.class_code != 0xFFFFFFFF]
+            elif self.model in smbios_data.smbios_dictionary:
+                gpu_archs = smbios_data.smbios_dictionary[self.model].get("Stock GPUs", [])
+
+            if any(arch in [
+                device_probe.AMD.Archs.Legacy_GCN_7000,
+                device_probe.AMD.Archs.Legacy_GCN_8000,
+                device_probe.AMD.Archs.Legacy_GCN_9000,
+            ] for arch in gpu_archs):
+                logging.info("- AMD Legacy GCN on Sequoia detected: Preserving Disable Library Validation for ad-hoc drivers")
+                return
 
         self.constants.disable_amfi = False
         self.constants.disable_cs_lv = False
